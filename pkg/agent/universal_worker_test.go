@@ -273,3 +273,105 @@ func TestUniversalWorker_RoomCallbacks(t *testing.T) {
 	assert.NotNil(t, callbacks.OnParticipantConnected)
 	assert.NotNil(t, callbacks.OnTrackPublished)
 }
+
+// TestUniversalWorker_ConcurrentRoomCallbacks tests for race conditions in room callback access
+func TestUniversalWorker_ConcurrentRoomCallbacks(t *testing.T) {
+	handler := &MockUniversalHandlerOld{}
+	worker := NewUniversalWorker("ws://localhost:7880", "devkey", "secret", handler, WorkerOptions{})
+
+	// Create a mock room and add it to the worker's rooms map
+	mockRoom := &lksdk.Room{}
+	job := &livekit.Job{
+		Id:   "test-job",
+		Type: livekit.JobType_JT_ROOM,
+		Room: &livekit.Room{Name: "test-room"},
+	}
+
+	// Add room to the map
+	worker.mu.Lock()
+	worker.rooms[job.Room.Name] = mockRoom
+	worker.mu.Unlock()
+
+	// Setup handler expectations
+	handler.On("OnRoomDisconnected", mock.Anything, mockRoom, mock.Anything).Maybe()
+	handler.On("OnRoomMetadataChanged", mock.Anything, mock.Anything, mock.Anything).Maybe()
+
+	callbacks := worker.createRoomCallbacks(job)
+
+	// Run concurrent operations to test for race conditions
+	var wg sync.WaitGroup
+	concurrency := 50
+	iterations := 100
+
+	// Start goroutines that read from the rooms map via callbacks
+	for i := 0; i < concurrency; i++ {
+		wg.Add(3)
+
+		// Test OnDisconnected callback
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				callbacks.OnDisconnected()
+				time.Sleep(time.Microsecond)
+			}
+		}()
+
+		// Test OnDisconnectedWithReason callback  
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				callbacks.OnDisconnectedWithReason(lksdk.LeaveRequested)
+				time.Sleep(time.Microsecond)
+			}
+		}()
+
+		// Test OnRoomMetadataChanged callback
+		go func() {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				callbacks.OnRoomMetadataChanged(fmt.Sprintf("metadata-%d", j))
+				time.Sleep(time.Microsecond)
+			}
+		}()
+	}
+
+	// Start goroutines that modify the rooms map (simulating cleanup)
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < iterations; j++ {
+				// Simulate adding and removing rooms
+				roomName := fmt.Sprintf("dynamic-room-%d", id)
+				worker.mu.Lock()
+				if j%2 == 0 {
+					worker.rooms[roomName] = mockRoom
+				} else {
+					delete(worker.rooms, roomName)
+				}
+				worker.mu.Unlock()
+				time.Sleep(time.Microsecond * 5)
+			}
+		}(i)
+	}
+
+	// Start a goroutine that simulates the cleanup in runJobHandler
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < iterations*2; i++ {
+			worker.mu.Lock()
+			// Simulate cleanup operations
+			delete(worker.rooms, job.Room.Name)
+			worker.rooms[job.Room.Name] = mockRoom
+			worker.mu.Unlock()
+			time.Sleep(time.Microsecond * 10)
+		}
+	}()
+
+	// Wait for all goroutines to complete
+	wg.Wait()
+
+	// Verify no panics occurred and handler was called
+	handler.AssertExpectations(t)
+}

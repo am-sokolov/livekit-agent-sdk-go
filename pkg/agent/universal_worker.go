@@ -1021,13 +1021,19 @@ func (w *UniversalWorker) createRoomCallbacks(job *livekit.Job) *lksdk.RoomCallb
 	return &lksdk.RoomCallback{
 		OnDisconnected: func() {
 			w.logger.Info("Disconnected from room", "jobID", job.Id)
-			if room, exists := w.rooms[job.Room.Name]; exists {
+			w.mu.Lock()
+			room, exists := w.rooms[job.Room.Name]
+			w.mu.Unlock()
+			if exists {
 				w.handler.OnRoomDisconnected(context.Background(), room, "normal disconnect")
 			}
 		},
 		OnDisconnectedWithReason: func(reason lksdk.DisconnectionReason) {
 			w.logger.Info("Disconnected from room with reason", "jobID", job.Id, "reason", reason)
-			if room, exists := w.rooms[job.Room.Name]; exists {
+			w.mu.Lock()
+			room, exists := w.rooms[job.Room.Name]
+			w.mu.Unlock()
+			if exists {
 				w.handler.OnRoomDisconnected(context.Background(), room, string(reason))
 			}
 
@@ -1081,7 +1087,10 @@ func (w *UniversalWorker) createRoomCallbacks(job *livekit.Job) *lksdk.RoomCallb
 			w.handler.OnActiveSpeakersChanged(context.Background(), speakers)
 		},
 		OnRoomMetadataChanged: func(metadata string) {
-			if room, exists := w.rooms[job.Room.Name]; exists {
+			w.mu.Lock()
+			room, exists := w.rooms[job.Room.Name]
+			w.mu.Unlock()
+			if exists {
 				oldMetadata := room.Metadata()
 				w.handler.OnRoomMetadataChanged(context.Background(), oldMetadata, metadata)
 			}

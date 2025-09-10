@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 func TestResourceLimiterMemoryLimit(t *testing.T) {
 	logger, _ := zap.NewDevelopment()
 
-	memoryExceeded := false
+	var memoryExceeded atomic.Bool
 	limiter := NewResourceLimiter(logger, ResourceLimiterOptions{
 		MemoryLimitMB:     200, // Reasonable limit for testing
 		CheckInterval:     50 * time.Millisecond,
@@ -25,7 +26,7 @@ func TestResourceLimiterMemoryLimit(t *testing.T) {
 	})
 
 	limiter.SetMemoryLimitCallback(func(usage, limit uint64) {
-		memoryExceeded = true
+		memoryExceeded.Store(true)
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -47,7 +48,7 @@ func TestResourceLimiterMemoryLimit(t *testing.T) {
 	// Wait for detection
 	time.Sleep(150 * time.Millisecond)
 
-	assert.True(t, memoryExceeded)
+	assert.True(t, memoryExceeded.Load())
 
 	metrics := limiter.GetMetrics()
 	assert.Greater(t, metrics["memory_violations"].(int64), int64(0))
