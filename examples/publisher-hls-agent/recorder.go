@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -33,6 +34,7 @@ type ParticipantRecorder struct {
 	room        string
 	outputDir   string
 	keepOpus    bool
+	logger      *slog.Logger
 
 	pipeline    *gst.Pipeline
 	videoAppSrc *app.Source
@@ -85,7 +87,12 @@ type ParticipantRecorder struct {
 
 	s3Uploader *RealtimeS3Uploader // Real-time S3 uploader (nil if disabled)
 
-	e2eeCtx *E2EEContext // E2EE decryption context (nil if disabled)
+	e2eeCtx        *E2EEContext    // E2EE decryption context (nil if disabled)
+	frameAssembler *FrameAssembler // Frame assembler for E2EE video decryption
+
+	// E2EE raw H264 video path (bypasses RTP depayload)
+	e2eeVideoAppSrc *app.Source
+	e2eeVideoQueue  *gst.Element
 }
 
 // Pre-buffer configuration for video and audio packets.
@@ -135,7 +142,8 @@ type RecordingSummary struct {
 //
 // Each recorder creates a unique temporary directory to support concurrent recordings.
 // Directory format: OUTPUT_DIR/room_participant_timestamp
-func NewParticipantRecorder(cfg *Config, roomName, participant string) (*ParticipantRecorder, error) {
+func NewParticipantRecorder(cfg *Config, roomName, participant string, e2eeEnabled bool) (*ParticipantRecorder, error) {
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	// Create single unique directory for this recording session
 	// Format: room_participant_timestamp (flat structure for easy cleanup)
 	timestamp := time.Now().Format("20060102-150405.000")
@@ -215,6 +223,48 @@ func NewParticipantRecorder(cfg *Config, roomName, participant string) (*Partici
 	_ = videoQueue.SetProperty("max-size-buffers", uint(0))
 	_ = videoQueue.SetProperty("max-size-bytes", uint(0))
 	_ = videoQueue.SetProperty("max-size-time", uint64(0))
+
+	// Create E2EE video pipeline elements only when E2EE is enabled
+	// This path is used when E2EE is enabled: encrypted RTP → frame assembly → decrypt → raw H264
+	var e2eeVideoSrc, e2eeH264Parse, e2eeVideoCapsFilter, e2eeVideoQueue *gst.Element
+	if e2eeEnabled {
+		e2eeVideoSrc, err = gst.NewElement("appsrc")
+		if err != nil {
+			return nil, fmt.Errorf("create e2ee video appsrc: %w", err)
+		}
+		_ = e2eeVideoSrc.SetProperty("is-live", true)
+		_ = e2eeVideoSrc.SetProperty("format", gst.FormatTime)
+		_ = e2eeVideoSrc.SetProperty("do-timestamp", false)
+		_ = e2eeVideoSrc.SetProperty("emit-signals", true)
+		_ = e2eeVideoSrc.SetProperty("block", false)
+		_ = e2eeVideoSrc.SetProperty("stream-type", 0)
+		_ = e2eeVideoSrc.SetProperty("max-bytes", uint64(10*1024*1024))
+		// Set caps for raw H264 Annex B format
+		e2eeCaps := gst.NewCapsFromString("video/x-h264,stream-format=byte-stream,alignment=au")
+		_ = e2eeVideoSrc.SetProperty("caps", e2eeCaps)
+
+		e2eeH264Parse, err = gst.NewElement("h264parse")
+		if err != nil {
+			return nil, fmt.Errorf("create e2ee h264parse: %w", err)
+		}
+		_ = e2eeH264Parse.SetProperty("disable-passthrough", true)
+		_ = e2eeH264Parse.SetProperty("config-interval", int32(-1))
+
+		e2eeVideoCapsFilter, err = gst.NewElement("capsfilter")
+		if err != nil {
+			return nil, fmt.Errorf("create e2ee video capsfilter: %w", err)
+		}
+		e2eeVideoCapsValue := gst.NewCapsFromString("video/x-h264,stream-format=byte-stream,alignment=au")
+		_ = e2eeVideoCapsFilter.SetProperty("caps", e2eeVideoCapsValue)
+
+		e2eeVideoQueue, err = gst.NewElement("queue")
+		if err != nil {
+			return nil, fmt.Errorf("create e2ee video queue: %w", err)
+		}
+		_ = e2eeVideoQueue.SetProperty("max-size-buffers", uint(0))
+		_ = e2eeVideoQueue.SetProperty("max-size-bytes", uint(0))
+		_ = e2eeVideoQueue.SetProperty("max-size-time", uint64(0))
+	}
 
 	audioSrc, err := gst.NewElement("appsrc")
 	if err != nil {
@@ -335,6 +385,12 @@ func NewParticipantRecorder(cfg *Config, roomName, participant string) (*Partici
 		videoSrc, videoJitter, videoDepay, h264parse, videoCapsFilter, videoQueue,
 		audioSrc, audioJitter, audioDepay,
 	}
+
+	// Add E2EE video path elements only when E2EE is enabled
+	if e2eeEnabled {
+		elements = append(elements, e2eeVideoSrc, e2eeH264Parse, e2eeVideoCapsFilter, e2eeVideoQueue)
+	}
+
 	if cfg.KeepOpus {
 		elements = append(elements, opusParse)
 	} else {
@@ -355,6 +411,13 @@ func NewParticipantRecorder(cfg *Config, roomName, participant string) (*Partici
 
 	if err := gst.ElementLinkMany(videoSrc, videoJitter, videoDepay, h264parse, videoCapsFilter, videoQueue); err != nil {
 		return nil, fmt.Errorf("failed to link video chain: %w", err)
+	}
+
+	// Link E2EE video pipeline (raw H264 path) only when E2EE is enabled
+	if e2eeEnabled {
+		if err := gst.ElementLinkMany(e2eeVideoSrc, e2eeH264Parse, e2eeVideoCapsFilter, e2eeVideoQueue); err != nil {
+			return nil, fmt.Errorf("link e2ee video chain: %w", err)
+		}
 	}
 
 	// Link audio pipeline based on codec configuration
@@ -379,6 +442,21 @@ func NewParticipantRecorder(cfg *Config, roomName, participant string) (*Partici
 	}
 	if linkRet := videoQueueSrc.Link(videoMuxPad); linkRet != gst.PadLinkOK {
 		return nil, fmt.Errorf("failed to link video queue to mux: %s", linkRet.String())
+	}
+
+	// Link E2EE video queue to muxer only when E2EE is enabled
+	if e2eeEnabled {
+		e2eeVideoMuxPad := mpegtsmux.GetRequestPad("sink_%d")
+		if e2eeVideoMuxPad == nil {
+			return nil, fmt.Errorf("get request pad from mpegtsmux for e2ee video")
+		}
+		e2eeVideoQueueSrc := e2eeVideoQueue.GetStaticPad("src")
+		if e2eeVideoQueueSrc == nil {
+			return nil, fmt.Errorf("get src pad from e2ee video queue")
+		}
+		if linkRet := e2eeVideoQueueSrc.Link(e2eeVideoMuxPad); linkRet != gst.PadLinkOK {
+			return nil, fmt.Errorf("link e2ee video queue to mux: %s", linkRet.String())
+		}
 	}
 
 	audioMuxPad := mpegtsmux.GetRequestPad("sink_%d")
@@ -419,18 +497,26 @@ func NewParticipantRecorder(cfg *Config, roomName, participant string) (*Partici
 	_ = os.Setenv("GST_DEBUG_DUMP_DOT_DIR", absDir)
 
 	recorder := &ParticipantRecorder{
-		participant:  participant,
-		room:         roomName,
-		outputDir:    absDir,
-		keepOpus:     cfg.KeepOpus,
-		pipeline:     pipeline,
-		videoAppSrc:  app.SrcFromElement(videoSrc),
-		audioAppSrc:  app.SrcFromElement(audioSrc),
-		videoDepay:   videoDepay,
-		audioDepay:   audioDepay,
-		startTime:    time.Now(),
-		videoReadyCh: make(chan struct{}),
-		s3Uploader:   s3Uploader,
+		logger:         logger,
+		participant:    participant,
+		room:           roomName,
+		outputDir:      absDir,
+		keepOpus:       cfg.KeepOpus,
+		pipeline:       pipeline,
+		videoAppSrc:    app.SrcFromElement(videoSrc),
+		audioAppSrc:    app.SrcFromElement(audioSrc),
+		videoDepay:     videoDepay,
+		audioDepay:     audioDepay,
+		startTime:      time.Now(),
+		videoReadyCh:   make(chan struct{}),
+		s3Uploader:     s3Uploader,
+		frameAssembler: NewFrameAssembler(),
+		e2eeVideoQueue: e2eeVideoQueue, // nil if E2EE disabled
+	}
+
+	// Set E2EE video appsrc only when E2EE is enabled
+	if e2eeEnabled && e2eeVideoSrc != nil {
+		recorder.e2eeVideoAppSrc = app.SrcFromElement(e2eeVideoSrc)
 	}
 
 	audioCodec := "AAC"
@@ -978,6 +1064,39 @@ func (r *ParticipantRecorder) clearPreAudioBuffer() {
 	r.preAudioMu.Unlock()
 }
 
+// pushE2EEVideoFrame pushes a decrypted H264 frame in Annex B format to the E2EE video appsrc.
+//
+// This function is used for E2EE video when we have complete decrypted frames
+// rather than individual RTP packets. The frame data is in Annex B format
+// (with start codes) and can be pushed directly to h264parse.
+//
+// Parameters:
+//   - frameData: Decrypted H264 frame in Annex B format
+//   - timestamp: RTP timestamp (32-bit, 90kHz clock)
+//
+// Returns:
+//   - nil on success
+//   - error if appsrc rejects the buffer
+func (r *ParticipantRecorder) pushE2EEVideoFrame(frameData []byte, timestamp uint32) error {
+	pts, relative := r.videoClockTime(timestamp)
+
+	buffer := gst.NewBufferFromBytes(frameData)
+	buffer.SetPresentationTimestamp(pts)
+
+	r.mu.Lock()
+	r.videoLastPTS = pts
+	r.videoLastTimestamp = relative
+	r.mu.Unlock()
+
+	if flow := r.e2eeVideoAppSrc.PushBuffer(buffer); flow != gst.FlowOK {
+		if flow == gst.FlowFlushing {
+			return fmt.Errorf("e2ee video appsrc flushing")
+		}
+		return fmt.Errorf("e2ee video appsrc push failed: %s", flow.String())
+	}
+	return nil
+}
+
 // pushVideoPacket converts an RTP packet to a GStreamer buffer and pushes it to the video appsrc.
 //
 // This function performs four critical operations:
@@ -1396,23 +1515,124 @@ func (r *ParticipantRecorder) AttachVideoTrack(ctx context.Context, track *webrt
 					return
 				}
 
-				// Decrypt E2EE-encrypted payload if E2EE is enabled
+				// For E2EE, use frame-level decryption instead of per-packet
+				// E2EE encryption happens at the frame level in Annex B format
+				// We need to collect RTP packets, reassemble to Annex B, decrypt, then push raw H264
 				if r.E2EEEnabled() && len(rtpPacket.Payload) > 0 {
+					// Add packet to frame assembler - it will return complete Annex B frame when ready
+					annexBFrame, frameTimestamp, complete := r.frameAssembler.AddPacket(rtpPacket)
+					if !complete {
+						// Frame not complete yet, wait for more packets
+						if firstPacket {
+							firstPacket = false
+							r.logger.Debug("E2EE: Requesting initial keyframe via PLI")
+							r.requestPLI(pliWriter, track.SSRC())
+						}
+						// Request PLI periodically while waiting for frames
+						if !r.handshakeReady.Load() {
+							handshakeWait++
+							if handshakeWait%200 == 0 {
+								r.logger.Debug("E2EE: Waiting for complete frame, sending PLI")
+								r.requestPLI(pliWriter, track.SSRC())
+							}
+						}
+						continue
+					}
+
+					// Frame is complete - decrypt it
 					r.mu.Lock()
 					e2eeCtx := r.e2eeCtx
 					r.mu.Unlock()
 
-					decrypted, err := e2eeCtx.DecryptVideo(rtpPacket.Payload)
-					if err != nil {
-						// Decryption failed - log and skip packet
-						log.Printf("[%s] video E2EE decryption error (seq=%d): %v", r.logPrefix(), rtpPacket.SequenceNumber, err)
+					decryptedFrame, decryptErr := e2eeCtx.DecryptVideoFrame(annexBFrame)
+					if decryptErr != nil {
+						log.Printf("[%s] video E2EE frame decryption error (ts=%d, frameSize=%d): %v",
+							r.logPrefix(), frameTimestamp, len(annexBFrame), decryptErr)
 						continue
 					}
-					if decrypted == nil {
+					if decryptedFrame == nil {
 						// Server Injected Frame - drop it
 						continue
 					}
-					rtpPacket.Payload = decrypted
+
+					// Check if this decrypted frame contains a keyframe
+					e2eeIsKeyframe := false
+					naluIndices := findNALUIndices(decryptedFrame)
+					for _, idx := range naluIndices {
+						if idx < len(decryptedFrame) {
+							nalType := decryptedFrame[idx] & 0x1F
+							if nalType == nalUnitTypeIDR {
+								e2eeIsKeyframe = true
+								break
+							}
+						}
+					}
+
+					// Signal handshake ready on first keyframe
+					if !r.handshakeReady.Load() {
+						if e2eeIsKeyframe {
+							r.mu.Lock()
+							r.videoKeyframeCount++
+							r.mu.Unlock()
+							r.signalVideoReady()
+							r.logger.Info("E2EE: Decrypted first keyframe (handshake ready)",
+								"ts", frameTimestamp, "frameSize", len(decryptedFrame))
+						} else {
+							handshakeWait++
+							if handshakeWait == 1 || handshakeWait%200 == 0 {
+								r.logger.Debug("E2EE: Waiting for keyframe, sending PLI")
+								r.requestPLI(pliWriter, track.SSRC())
+							}
+							continue
+						}
+					}
+
+					// Wait for recording activation
+					if !r.recordingActive.Load() {
+						continue
+					}
+
+					// Wait for keyframe to start recording
+					if r.recordingKeyframePending.Load() {
+						if !e2eeIsKeyframe {
+							recordingWait++
+							if recordingWait == 1 || recordingWait%200 == 0 {
+								r.logger.Debug("E2EE: Waiting for keyframe to begin recording, sending PLI")
+								r.requestPLI(pliWriter, track.SSRC())
+							}
+							continue
+						}
+
+						r.mu.Lock()
+						r.videoKeyframeCount++
+						r.mu.Unlock()
+
+						// Start pipeline on first recording keyframe
+						if !r.pipelineStarted.Load() {
+							r.logger.Info("E2EE: Starting GStreamer pipeline with first decrypted keyframe")
+							if startErr := r.pipeline.SetState(gst.StatePlaying); startErr != nil {
+								r.logger.Error("E2EE: start pipeline", "error", startErr)
+								return
+							}
+							r.pipeline.DebugBinToDotFileWithTs(gst.DebugGraphShowAll, "publisher_recorder_e2ee")
+							r.pipelineStarted.Store(true)
+						}
+
+						r.recordingKeyframePending.Store(false)
+					}
+
+					// Push decrypted frame to E2EE video appsrc
+					if pushErr := r.pushE2EEVideoFrame(decryptedFrame, frameTimestamp); pushErr != nil {
+						r.logger.Error("E2EE video push error", "error", pushErr)
+						return
+					}
+
+					r.mu.Lock()
+					r.videoPacketCount++
+					r.videoBytesReceived += int64(len(decryptedFrame))
+					r.mu.Unlock()
+
+					continue // Skip normal RTP processing for E2EE
 				}
 
 				if firstPacket {

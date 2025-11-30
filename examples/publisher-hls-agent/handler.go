@@ -165,7 +165,7 @@ func (h *PublisherHLSHandler) OnJobAssigned(ctx context.Context, jobCtx *agent.J
 	participantIdentity := jobCtx.Job.Participant.Identity
 	roomName := jobCtx.Job.Room.Name
 
-	recorder, err := NewParticipantRecorder(h.cfg, roomName, participantIdentity)
+	recorder, err := NewParticipantRecorder(h.cfg, roomName, participantIdentity, h.cfg.E2EEEnabled())
 	if err != nil {
 		return fmt.Errorf("failed to create recorder: %w", err)
 	}
