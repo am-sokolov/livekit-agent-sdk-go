@@ -71,6 +71,7 @@ examples/livekit-cloud-example/*.log
 /examples/publisher-hls-agent/*.mp4
 /examples/publisher-hls-agent/**/*.mp4
 /examples/publisher-hls-agent/*.log
+/examples/publisher-hls-agent/tmp/
 
 # Claude AI session data
 /.claude/

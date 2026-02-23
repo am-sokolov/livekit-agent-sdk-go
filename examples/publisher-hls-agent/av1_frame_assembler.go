@@ -1,22 +1,22 @@
 package main
 
 import (
-	"fmt"
-	"sort"
 	"sync"
 
 	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
+	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 )
 
-// AV1FrameAssembler collects RTP packets for a single AV1 stream and assembles
-// complete OBU-stream frames (with OBU size fields) on marker-bit boundaries.
+// AV1FrameAssembler reconstructs complete AV1 samples from RTP packets.
+//
+// We rely on Pion's samplebuilder to tolerate packet reordering/duplication and
+// avoid prematurely cutting a frame at marker-bit boundaries (important for AV1
+// SVC/multi-layer streams). The resulting sample data is low-overhead AV1 OBU
+// stream with size fields, suitable for AV1 E2EE metadata parsing/decryption.
 type AV1FrameAssembler struct {
 	mu sync.Mutex
 
-	pendingPackets map[uint32][]*rtp.Packet
-
-	logPrefix string
+	builder *samplebuilder.SampleBuilder
 }
 
 // AV1AssembledFrame represents a single assembled AV1 frame as an OBU stream.
@@ -26,14 +26,17 @@ type AV1AssembledFrame struct {
 }
 
 // NewAV1FrameAssembler constructs a new AV1FrameAssembler instance.
-func NewAV1FrameAssembler(logPrefix string) *AV1FrameAssembler {
+func NewAV1FrameAssembler(_ string) *AV1FrameAssembler {
 	return &AV1FrameAssembler{
-		pendingPackets: make(map[uint32][]*rtp.Packet),
-		logPrefix:      logPrefix,
+		builder: samplebuilder.New(
+			512, // tolerate bursty reordering/loss on AV1 SVC streams
+			&av1DepacketizerPreserve{},
+			90000, // AV1 RTP clock rate
+		),
 	}
 }
 
-// AddPacket adds an RTP packet to the assembler and returns a complete frame when the marker bit is set.
+// AddPacket adds an RTP packet to the assembler and returns a complete frame when available.
 func (a *AV1FrameAssembler) AddPacket(pkt *rtp.Packet) (*AV1AssembledFrame, error) {
 	if pkt == nil || len(pkt.Payload) == 0 {
 		return nil, nil
@@ -42,38 +45,27 @@ func (a *AV1FrameAssembler) AddPacket(pkt *rtp.Packet) (*AV1AssembledFrame, erro
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	a.pendingPackets[pkt.Timestamp] = append(a.pendingPackets[pkt.Timestamp], pkt.Clone())
-
-	if !pkt.Marker {
+	a.builder.Push(pkt.Clone())
+	sample := a.builder.Pop()
+	if sample == nil || len(sample.Data) == 0 {
 		return nil, nil
 	}
 
-	packets := a.pendingPackets[pkt.Timestamp]
-	delete(a.pendingPackets, pkt.Timestamp)
-
-	sort.Slice(packets, func(i, j int) bool {
-		return packets[i].SequenceNumber < packets[j].SequenceNumber
-	})
-
-	var dep codecs.AV1Depacketizer
-	var out []byte
-	for _, p := range packets {
-		b, err := dep.Unmarshal(p.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("[%s] AV1 depacketize failed (seq=%d): %w", a.logPrefix, p.SequenceNumber, err)
-		}
-		out = append(out, b...)
-	}
-
 	return &AV1AssembledFrame{
-		Data:      out,
-		Timestamp: pkt.Timestamp,
+		Data:      append([]byte(nil), sample.Data...),
+		Timestamp: sample.PacketTimestamp,
 	}, nil
 }
 
-// Flush drops all pending packets currently buffered by timestamp.
+// Flush clears buffered packets and assembled samples.
 func (a *AV1FrameAssembler) Flush() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.pendingPackets = make(map[uint32][]*rtp.Packet)
+
+	a.builder.Flush()
+	for {
+		if a.builder.Pop() == nil {
+			break
+		}
+	}
 }

@@ -1165,8 +1165,8 @@ func runE2EScenario(t *testing.T, scenario e2eScenario) e2eResult {
 			}
 			t.Fatalf("unexpected participant count: got %d participants (%v), expected publisher + agent", len(resp.Participants), identities)
 		}
-		if nonPublisher[0].Kind != livekit.ParticipantInfo_EGRESS {
-			t.Fatalf("unexpected recorder participant kind: got %s, expected EGRESS", nonPublisher[0].Kind.String())
+		if nonPublisher[0].Kind != livekit.ParticipantInfo_AGENT {
+			t.Fatalf("unexpected recorder participant kind: got %s, expected AGENT", nonPublisher[0].Kind.String())
 		}
 	}
 

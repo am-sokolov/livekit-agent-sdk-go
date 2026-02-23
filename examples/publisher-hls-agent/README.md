@@ -526,6 +526,33 @@ docker run -p 9000:9000 -p 9001:9001 \
 go test -v -run TestPublisherHLSAgentUploadsToS3
 ```
 
+### Repro Script: Meet + AV1 + E2EE
+
+This script reproduces the local LiveKit Meet flow with AV1 + E2EE and agent dispatch:
+
+```bash
+cd examples/publisher-hls-agent
+./repro_meet_av1_e2ee.sh
+```
+
+What it does:
+- Starts local `livekit-server`
+- Starts `publisher-hls-agent` with `AUTO_ACTIVATE_RECORDING=true`
+- Builds local `../client-sdk-js` and links it into local `../meet`
+- Starts local Meet app
+- Creates a room with agent dispatch
+- Generates a custom Meet URL with:
+  - `codec=av1`
+  - E2EE passphrase in URL hash
+  - pre-minted participant token
+
+Environment overrides:
+- `AGENT_NAME`, `ROOM_NAME`, `E2EE_PASSPHRASE`
+- `LIVEKIT_HTTP_URL`, `LIVEKIT_WS_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`
+- `MEET_DIR`, `CLIENT_SDK_DIR`, `MEET_PORT`, `MEET_BASE_URL`
+- `SKIP_SDK_LINK=1` to skip rebuilding/relinking `livekit-client`
+- `OPEN_BROWSER=1` to auto-open the generated Meet URL (macOS `open`)
+
 ## Output Structure
 
 ### Local Storage
